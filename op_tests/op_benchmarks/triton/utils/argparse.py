@@ -1,4 +1,8 @@
 import argparse
+from collections.abc import Iterable
+from typing import TypeVar
+
+_T = TypeVar("_T")
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
@@ -24,6 +28,22 @@ def pow2_int(value: str) -> int:
     if int_value & (int_value - 1):
         raise argparse.ArgumentTypeError(f"'{value}' is not a power of 2")
     return int_value
+
+
+def override_parser_action(
+    parser: argparse.ArgumentParser,
+    action: str,
+    choices: Iterable[_T] | None = None,
+    default: _T | None = None,
+    help: str | None = None,
+):
+    act = parser._option_string_actions[action]
+    if default is not None:
+        act.default = default
+    if choices is not None:
+        act.choices = choices
+    if help is not None:
+        act.help = help
 
 
 def get_parser(kernel_name: str) -> argparse.ArgumentParser:

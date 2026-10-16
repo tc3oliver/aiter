@@ -428,9 +428,29 @@ def do_bench_aiter_triton(
     kernels_per_graph: int = 1000,
     num_replays: int = 10,
     warmup_replays: int = 3,
+    dist_group=None,
 ) -> float:
+    """Rotating-buffer CUDA graph benchmark.
+
+    ``dist_group``: a ``torch.distributed`` process group. Pass it when
+    ``fn`` performs real cross-rank communication (e.g. a combine/all-to-all
+    step) so every rank's capture and replay phases line up. It is only a
+    barrier at each phase boundary (warmup, capture, replay) -- unlike the
+    old ``do_bench_cudagraph_synced``, no cross-rank latency estimate needs
+    to be agreed on, because ``kernels_per_graph`` is a fixed constant and is
+    therefore already identical on every rank. The returned latency is the
+    local rank's own measurement; callers that want one number across ranks
+    must reduce it themselves (e.g. ``dist.all_reduce(..., op=MAX)``).
+    """
+
+    def _barrier():
+        if dist_group is not None:
+            import torch.distributed as dist
+
+            dist.barrier(group=dist_group)
 
     # warmup
+    _barrier()
     for _ in range(warmup_iters):
         fn(**(rot_bufs[0]))
     torch.cuda.synchronize()
@@ -444,6 +464,7 @@ def do_bench_aiter_triton(
     fns = [_make_fn(i) for i in range(kernels_per_graph)]
 
     # capture graph
+    _barrier()
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         for f in fns[: min(3, len(fns))]:
@@ -457,6 +478,7 @@ def do_bench_aiter_triton(
     torch.cuda.synchronize()
 
     # warmup replays
+    _barrier()
     for _ in range(warmup_replays):
         g.replay()
     torch.cuda.synchronize()
