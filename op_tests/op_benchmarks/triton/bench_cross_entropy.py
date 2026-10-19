@@ -8,6 +8,7 @@ backward provider exercises ``_ce_grad_scale_kernel``.
 """
 
 import argparse
+import functools
 
 import torch
 import triton
@@ -17,6 +18,8 @@ from aiter.ops.triton.cross_entropy import (
     cross_entropy_forward,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
 )
 
@@ -24,6 +27,20 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 def _bytes_moved(B_SQ, V, dtype):
     # forward reads logits once and writes the gradient in-place once.
     return 2 * B_SQ * V * torch.tensor([], dtype=dtype).element_size()
+
+
+def _generate_ce_fwd_pool_inputs(B_SQ, V, dtype):
+    logits = torch.randn(B_SQ, 1, V, dtype=dtype, device="cuda")
+    target = torch.randint(0, V, (B_SQ, 1), device="cuda")
+    return logits, target
+
+
+def _generate_ce_bwd_pool_inputs(B_SQ, V, dtype):
+    logits = torch.randn(B_SQ, 1, V, dtype=dtype, device="cuda")
+    target = torch.randint(0, V, (B_SQ, 1), device="cuda")
+    _, grad = cross_entropy_forward(logits, target, 0.0, True, None, -100)
+    grad_output = torch.tensor(2.0, device="cuda")
+    return grad, grad_output
 
 
 def benchmark(args):
@@ -52,24 +69,33 @@ def benchmark(args):
     @triton.testing.perf_report([config])
     def _run(B_SQ, V, provider):
         torch.manual_seed(0)
-        logits = torch.randn(B_SQ, 1, V, dtype=dtype, device="cuda")
-        target = torch.randint(0, V, (B_SQ, 1), device="cuda")
 
         if provider == "fwd":
+            _p_gen = functools.partial(_generate_ce_fwd_pool_inputs, B_SQ, V, dtype)
+            _out_val_keys = ["logits", "target"]
 
-            def fn():
-                cross_entropy_forward(logits.clone(), target, 0.0, True, None, -100)
+            def kernel_fn(logits, target):
+                # validate_targets=False: the default path's range check is a
+                # host sync (target.all()), which CUDA graph capture forbids.
+                cross_entropy_forward(
+                    logits, target, 0.0, True, None, -100, validate_targets=False
+                )
 
         else:  # bwd: scale the stored gradient (grad_output != 1 to force kernel)
-            _, grad = cross_entropy_forward(
-                logits.clone(), target, 0.0, True, None, -100
-            )
-            grad_output = torch.tensor(2.0, device="cuda")
+            _p_gen = functools.partial(_generate_ce_bwd_pool_inputs, B_SQ, V, dtype)
+            _out_val_keys = ["grad", "grad_output"]
 
-            def fn():
-                cross_entropy_backward(grad.clone(), grad_output)
+            def kernel_fn(grad, grad_output):
+                cross_entropy_backward(grad, grad_output)
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        # V up to ~152k makes a single logits/grad buffer multi-GB; a floor of
+        # 4 pool entries could quadruple an already multi-GB config and OOM.
+        # Use a smaller floor, as large tensors already exceed L2 capacity on
+        # their own and get little extra benefit from rotation anyway.
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], target_mb=256, min_pool_len=2
+        )
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
         if args.metric == "time":
             return ms
         return _bytes_moved(B_SQ, V, dtype) * 1e-9 / (ms * 1e-3)

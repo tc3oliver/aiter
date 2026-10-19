@@ -3,6 +3,7 @@
 """Benchmark 32x32 block-scaled MXFP4 quantization."""
 
 import argparse
+import functools
 import sys
 
 import torch
@@ -16,6 +17,8 @@ from aiter.utility.fp4_utils import (
 )
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
 )
 
@@ -66,6 +69,11 @@ def _default_shapes() -> list[tuple[int, int]]:
     ]
 
 
+def _generate_mxfp4_blockscale_pool_inputs(M, N, dtype):
+    x = torch.randn((M, N), dtype=dtype, device="cuda")
+    return (x,)
+
+
 def run_benchmark(args):
     shapes = [tuple(args.shape)] if args.shape is not None else _default_shapes()
     providers = args.provider.split(",")
@@ -111,16 +119,25 @@ def run_benchmark(args):
         metric,
         peak_bandwidth_gbps,
     ):
-        x = torch.randn((M, N), dtype=_get_dtype(dtype), device="cuda")
-        fn = (
-            (lambda: dynamic_mxfp4_quant_blockscale(x))
-            if provider == "aiter"
-            else (lambda: _torch_mxfp4_quant_blockscale(x))
+        _p_gen = functools.partial(
+            _generate_mxfp4_blockscale_pool_inputs, M, N, _get_dtype(dtype)
         )
-        elapsed_ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        _out_val_keys = ["x"]
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], target_mb=256, min_pool_len=4
+        )
+        kernel_fn = (
+            dynamic_mxfp4_quant_blockscale
+            if provider == "aiter"
+            else _torch_mxfp4_quant_blockscale
+        )
+        elapsed_ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
 
         # Minimum semantic traffic: read input, write packed payload and scale grid.
-        total_bytes = x.numel() * x.element_size() + M * N // 2 + M * N // 1024
+        sample_x = rot_bufs[0]["x"]
+        total_bytes = (
+            sample_x.numel() * sample_x.element_size() + M * N // 2 + M * N // 1024
+        )
         bandwidth_gbps = total_bytes / (elapsed_ms * 1e-3) * 1e-9
         if metric == "time":
             return elapsed_ms

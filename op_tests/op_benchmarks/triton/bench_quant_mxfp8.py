@@ -8,12 +8,28 @@
 """
 
 import argparse
+import functools
 
 import torch
 import triton
 
 from aiter.ops.triton.quant.quant_mxfp8 import convert_from_mxfp8, convert_to_mxfp8
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
+
+
+def _generate_mxfp8_to_pool_inputs(M, N, in_dtype):
+    x = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    return (x,)
+
+
+def _generate_mxfp8_from_pool_inputs(M, N, in_dtype, fp8_dtype):
+    x = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    y, s = convert_to_mxfp8(x, fp8_dtype, quant_block_size=32)
+    return y, s
 
 
 def benchmark(args):
@@ -37,13 +53,26 @@ def benchmark(args):
 
     @triton.testing.perf_report([config])
     def _run(M, N, provider):
-        x = torch.randn(M, N, device="cuda", dtype=in_dtype)
         if provider == "to":
-            fn = lambda: convert_to_mxfp8(x, fp8_dtype, quant_block_size=32)
+            _p_gen = functools.partial(_generate_mxfp8_to_pool_inputs, M, N, in_dtype)
+            _out_val_keys = ["x"]
+
+            def kernel_fn(x):
+                convert_to_mxfp8(x, fp8_dtype, quant_block_size=32)
+
         else:
-            y, s = convert_to_mxfp8(x, fp8_dtype, quant_block_size=32)
-            fn = lambda: convert_from_mxfp8(y, s, in_dtype, quant_block_size=32)
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+            _p_gen = functools.partial(
+                _generate_mxfp8_from_pool_inputs, M, N, in_dtype, fp8_dtype
+            )
+            _out_val_keys = ["y", "s"]
+
+            def kernel_fn(y, s):
+                convert_from_mxfp8(y, s, in_dtype, quant_block_size=32)
+
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], target_mb=256, min_pool_len=4
+        )
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
         if args.metric == "time":
             return ms
         # bytes: high-precision payload + fp8 payload + one e8m0 scale byte per 32
